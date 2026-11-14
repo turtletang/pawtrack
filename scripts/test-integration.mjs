@@ -1,5 +1,5 @@
 // Real Next HTTP + Prisma + disposable PostgreSQL. No .env is read by this runner.
-import { mkdtemp, readFile, writeFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, readdir, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -72,9 +72,18 @@ try {
   const authUrl = `http://127.0.0.1:${auth.address().port}`;
   // New cluster, loopback only, unrelated to any existing local or hosted database.
   await run(join(pgBin, "initdb"), ["-D", dataDir, "-U", "pawtrack_test", "-A", "trust", "--no-locale", "--encoding=UTF8"]);
-  await run(join(pgBin, "pg_ctl"), ["-D", dataDir, "-l", join(directory, "postgres.log"), "-o", `-c timezone=UTC -h 127.0.0.1 -p ${pgPort} -k ${directory}`, "-w", "start"]);
+  // Temporary, local-only CA/server key: exercise production's verified TLS path.
+  // Never use this generated fixture certificate against a hosted database.
+  const fixtureCert = join(dataDir, "server.crt");
+  const fixtureKey = join(dataDir, "server.key");
+  await run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+    "-subj", "/CN=localhost", "-addext", "basicConstraints=critical,CA:TRUE",
+    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-keyout", fixtureKey, "-out", fixtureCert]);
+  await chmod(fixtureKey, 0o600);
+  const fixtureCa = await readFile(fixtureCert, "utf8");
+  await run(join(pgBin, "pg_ctl"), ["-D", dataDir, "-l", join(directory, "postgres.log"), "-o", `-c timezone=UTC -c ssl=on -h 127.0.0.1 -p ${pgPort} -k ${directory}`, "-w", "start"]);
   postgresStarted = true;
-  const databaseUrl = `postgresql://pawtrack_test@127.0.0.1:${pgPort}/postgres`;
+  const databaseUrl = `postgresql://pawtrack_test@127.0.0.1:${pgPort}/postgres?sslmode=verify-full&sslrootcert=${encodeURIComponent(fixtureCert)}`;
   database = new pg.Pool({ connectionString: databaseUrl });
   for (const migration of (await readdir(join(root, "prisma/migrations"))).filter(name => /^\d/.test(name)).sort()) {
     await database.query(await readFile(join(root, "prisma/migrations", migration, "migration.sql"), "utf8"));
@@ -119,7 +128,7 @@ try {
     BEGIN IF NEW.name = 'db-fail.pdf' AND NEW.status = 'READY' THEN RAISE EXCEPTION 'Simulated finalize failure'; END IF; RETURN NEW; END $$;
     CREATE TRIGGER test_document_ready BEFORE UPDATE ON "Document" FOR EACH ROW EXECUTE FUNCTION public.test_fail_document_ready();`);
   const baseUrl = `http://localhost:${appPort}`;
-  const env = { ...process.env, DATABASE_URL: databaseUrl, DIRECT_URL: databaseUrl,
+  const env = { ...process.env, DATABASE_URL: databaseUrl, DIRECT_URL: databaseUrl, SUPABASE_DB_CA_CERT: fixtureCa,
     NEXT_PUBLIC_SUPABASE_URL: authUrl, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "integration-test-only",
     CRON_SECRET: cronSecret, SUPABASE_SERVICE_ROLE_KEY: serviceKey, SUPABASE_STORAGE_BUCKET: "pet-documents",
     TEST_CRON_SECRET: cronSecret, TEST_STORAGE_URL: authUrl, TEST_SERVICE_KEY: serviceKey,
