@@ -1,0 +1,109 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+datasource db {
+  provider = "postgresql"
+}
+model User {
+  id        String   @id @db.Uuid
+  pets      Pet[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model Pet {
+  id          String   @id @default(uuid()) @db.Uuid
+  ownerId     String   @db.Uuid
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String   @db.VarChar(80)
+  species     String   @db.VarChar(40)
+  breed       String?  @db.VarChar(100)
+  dateOfBirth DateTime? @db.Date
+  sex         Sex?
+  weight      Decimal? @db.Decimal(6, 2)
+  photoUrl    String?  @db.VarChar(2048)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  weights     WeightRecord[]
+  vaccinations Vaccination[]
+  vetVisits   VetVisit[]
+  medications Medication[]
+  reminders   Reminder[]
+  documents   Document[]
+  @@index([ownerId, createdAt])
+}
+enum Sex {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+model WeightRecord {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  weightKg Decimal @db.Decimal(6, 2)
+  recordedAt DateTime @default(now())
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  @@index([petId, recordedAt])
+}
+model Vaccination {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  name String
+  administeredAt DateTime
+  nextDueAt DateTime?
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  @@index([petId, administeredAt])
+  @@index([nextDueAt])
+}
+model VetVisit {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  visitedAt DateTime
+  clinic String
+  reason String?
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  @@index([petId, visitedAt])
+}
+model Medication {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  name String
+  dosage String
+  instructions String?
+  frequency String?
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  startsAt DateTime
+  endsAt DateTime?
+  @@index([petId])
+}
+model Reminder {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  title String
+  dueAt DateTime
+  completedAt DateTime?
+  @@index([petId, dueAt])
+}
+model Document {
+  id String @id @default(uuid()) @db.Uuid
+  petId String @db.Uuid
+  pet Pet @relation(fields: [petId], references: [id], onDelete: Cascade)
+  name String
+  storagePath String @unique
+  mimeType String
+  createdAt DateTime @default(now())
+  @@index([petId])
+}
