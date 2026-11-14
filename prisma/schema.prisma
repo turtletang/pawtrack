@@ -95,6 +95,17 @@ model Reminder {
   title String
   dueAt DateTime
   completedAt DateTime?
+  dismissedAt DateTime?
+  processedAt DateTime?
+  source ReminderSource @default(MANUAL)
+  category ReminderCategory @default(OTHER)
+  status ReminderStatus @default(PENDING)
+  vaccinationId String? @db.Uuid
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  @@unique([vaccinationId, dueAt])
+  @@index([status, dueAt])
   @@index([petId, dueAt])
 }
 model Document {
@@ -104,6 +115,42 @@ model Document {
   name String
   storagePath String @unique
   mimeType String
+  sizeBytes Int?
+  status DocumentStatus @default(READY)
+  updatedAt DateTime @default(now()) @updatedAt
   createdAt DateTime @default(now())
+  @@index([petId, status])
   @@index([petId])
+}
+
+// No foreign key to Pet: inventory must survive a cascading pet deletion for cleanup.
+model StorageObject {
+  id String @id @db.Uuid
+  path String @unique
+  ownerId String @db.Uuid
+  petId String @db.Uuid
+  status DocumentStatus @default(UPLOADING)
+  leaseUntil DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  @@index([status, leaseUntil])
+}
+enum ReminderSource {
+  MANUAL
+  VACCINATION
+}
+enum ReminderCategory {
+  MEDICATION
+  VET_APPOINTMENT
+  OTHER
+}
+enum ReminderStatus {
+  PENDING
+  COMPLETED
+  DISMISSED
+}
+enum DocumentStatus {
+  UPLOADING
+  READY
+  DELETING
 }

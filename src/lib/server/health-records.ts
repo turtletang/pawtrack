@@ -2,7 +2,10 @@ import "server-only";
 import { z } from "zod";
 import { db } from "./db";
 import { HttpError } from "./http";
+import { requireOwnedPet } from "./pets";
 import { ownedPetWhere } from "@/lib/ownership";
+import { syncVaccination } from "./reminders";
+export { requireOwnedPet } from "./pets";
 import { weightSchema, vaccinationSchema, vetVisitSchema, medicationSchema, type HealthResource, type HealthBundle } from "@/lib/health-records";
 import type { WeightRecord, Vaccination, VetVisit, Medication } from "@/generated/prisma/client";
 
@@ -15,9 +18,6 @@ function parse<T extends z.ZodType>(schema: T, body: unknown): z.output<T> {
   const result = schema.safeParse(body);
   if (!result.success) throw new HttpError(422, result.error.issues.map(issue => `${issue.path.join(".")}: ${issue.message}`).join(" "));
   return result.data;
-}
-export async function requireOwnedPet(petId: string, ownerId: string) {
-  if (!await db().pet.findFirst({ where: ownedPetWhere(petId, ownerId), select: { id: true } })) throw new HttpError(404, "Pet not found.");
 }
 export async function listHealth(petId: string, ownerId: string): Promise<HealthBundle> {
   await requireOwnedPet(petId, ownerId);
@@ -55,7 +55,11 @@ export async function saveHealth(petId: string, ownerId: string, resource: Healt
     }
     case "vaccinations": {
       const data = parse(vaccinationSchema, body);
-      const record = id ? (await db().vaccination.updateManyAndReturn({ where, data }))[0] : await db().vaccination.create({ data: { ...data, pet } });
+      const record = await db().$transaction(async tx => {
+        const vaccination = id ? (await tx.vaccination.updateManyAndReturn({ where, data }))[0] : await tx.vaccination.create({ data: { ...data, pet } });
+        if (vaccination) await syncVaccination(tx, vaccination);
+        return vaccination;
+      });
       if (record) return vaccinationView(record); break;
     }
     case "vet-visits": {
@@ -74,7 +78,11 @@ export async function saveHealth(petId: string, ownerId: string, resource: Healt
 export async function deleteHealth(petId: string, ownerId: string, resource: HealthResource, id: string) {
   const where = { id, petId, pet: { ownerId } };
   const result = resource === "weights" ? await db().weightRecord.deleteMany({ where })
-    : resource === "vaccinations" ? await db().vaccination.deleteMany({ where })
+    : resource === "vaccinations" ? await db().$transaction(async tx => {
+      const deleted = await tx.vaccination.deleteMany({ where });
+      if (deleted.count) await tx.reminder.updateMany({ where: { vaccinationId: id, status: "PENDING", pet: { ownerId } }, data: { status: "DISMISSED", dismissedAt: new Date() } });
+      return deleted;
+    })
     : resource === "vet-visits" ? await db().vetVisit.deleteMany({ where }) : await db().medication.deleteMany({ where });
   if (!result.count) throw new HttpError(404, "Health record not found.");
 }

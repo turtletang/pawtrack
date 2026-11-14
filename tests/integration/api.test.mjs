@@ -221,3 +221,151 @@ await test("health record CRUD and isolation over HTTP", async t => {
   });
   for (const profile of [a,b,sibling]) assert.equal((await api("DELETE", `/api/pets/${profile.id}`, profile.id === b.id ? "b" : "a")).status, 204);
 });
+
+async function cron(secret = process.env.TEST_CRON_SECRET) {
+  return fetch(`${base}/api/cron/process-reminders`, { headers: secret ? { Authorization: `Bearer ${secret}` } : {}, redirect: "manual" });
+}
+await test("persistent reminders and idempotent scheduled processing", async t => {
+  const a = await pet(await api("POST", "/api/pets", "a", { name: "Reminder pet", species: "Dog" }));
+  const b = await pet(await api("POST", "/api/pets", "b", { name: "Other reminder pet", species: "Cat" }));
+  const today = new Date().toISOString().slice(0,10);
+  const tomorrow = new Date(Date.parse(today)+86400000).toISOString().slice(0,10);
+  let automatic; let vaccine;
+  await t.test("vaccination writes create one reminder and cron requires its secret", async () => {
+    vaccine = (await (await api("POST", `/api/pets/${a.id}/vaccinations`, "a", { name: "Reminder vaccine", administeredAt: "2020-01-01", nextDueAt: today })).json()).record;
+    const reminders = (await (await api("GET", `/api/pets/${a.id}/reminders`, "a")).json()).reminders;
+    assert.equal(reminders.length, 1); automatic = reminders[0];
+    assert.equal(automatic.source, "VACCINATION");
+    assert.equal((await cron("")).status, 401);
+    assert.equal((await cron("invalid-secret")).status, 401);
+    const first = await cron(); assert.equal(first.status, 200);
+    const processed = (await (await api("GET", `/api/pets/${a.id}/reminders/${automatic.id}`, "a")).json()).reminder;
+    assert.ok(processed.processedAt);
+    for (const response of await Promise.all([cron(), cron()])) assert.equal(response.status, 200);
+    const again = (await (await api("GET", `/api/pets/${a.id}/reminders`, "a")).json()).reminders;
+    assert.equal(again.length, 1); assert.equal(again[0].processedAt, processed.processedAt);
+  });
+  await t.test("manual reminders are isolated and terminal states survive repeated jobs", async () => {
+    const path = `/api/pets/${a.id}/reminders`;
+    const body = { title: "Vet appointment", category: "VET_APPOINTMENT", dueAt: today };
+    const created = await api("POST", path, "a", body); assert.equal(created.status, 201);
+    const manual = (await created.json()).reminder;
+    for (const [method, url, payload] of [["GET", path], ["POST", path, body], ["GET", `${path}/${manual.id}`], ["PATCH", `${path}/${manual.id}`, { status: "DISMISSED" }]]) {
+      assert.equal((await api(method, url, "b", payload)).status, 404);
+      assert.equal((await api(method, url, undefined, payload)).status, 401);
+    }
+    assert.equal((await api("PATCH", `/api/pets/${b.id}/reminders/${manual.id}`, "b", { status: "COMPLETED" })).status, 404);
+    assert.equal((await api("POST", path, "a", { ...body, ownerId: process.env.TEST_OWNER_B })).status, 422);
+    assert.equal((await api("POST", path, "a", { ...body, dueAt: "2026-02-30" })).status, 422);
+    const finished = (await (await api("PATCH", `${path}/${automatic.id}`, "a", { status: "COMPLETED" })).json()).reminder;
+    assert.ok(finished.completedAt);
+    assert.equal((await api("PATCH", `${path}/${manual.id}`, "a", { status: "DISMISSED" })).status, 200);
+    await cron(); await cron();
+    const records = (await (await api("GET", path, "a")).json()).reminders;
+    assert.equal(records.find(r => r.id === automatic.id).status, "COMPLETED");
+    assert.equal(records.find(r => r.id === automatic.id).completedAt, finished.completedAt);
+    assert.equal(records.find(r => r.id === manual.id).status, "DISMISSED");
+    assert.equal((await (await api("GET", "/api/reminders?ownerId=forged", "b")).json()).reminders.some(r => r.petId === a.id), false);
+    assert.equal((await api("GET", "/api/reminders")).status, 401);
+  });
+  await t.test("changed due dates create a new key, old pending reminders dismiss, deletion preserves history", async () => {
+    const path = `/api/pets/${a.id}/vaccinations/${vaccine.id}`;
+    assert.equal((await api("PUT", path, "a", { name: "Changed vaccine", administeredAt: "2020-01-01", nextDueAt: tomorrow })).status, 200);
+    let records = (await (await api("GET", `/api/pets/${a.id}/reminders`, "a")).json()).reminders;
+    assert.equal(records.filter(r => r.source === "VACCINATION").length, 2);
+    const newReminder = records.find(r => r.dueAt === tomorrow);
+    assert.ok(newReminder); assert.equal(newReminder.status, "PENDING");
+    assert.equal((await api("PUT", path, "a", { name: "Changed vaccine", administeredAt: "2020-01-01", nextDueAt: null })).status, 200);
+    await cron();
+    records = (await (await api("GET", `/api/pets/${a.id}/reminders`, "a")).json()).reminders;
+    assert.equal(records.find(r => r.id === newReminder.id).status, "DISMISSED");
+    assert.equal((await api("DELETE", path, "a")).status, 204);
+    assert.equal((await api("GET", "/reminders", "a")).status, 200);
+  });
+  await api("DELETE", `/api/pets/${a.id}`, "a"); await api("DELETE", `/api/pets/${b.id}`, "b");
+});
+
+async function storageStats() {
+  return (await fetch(`${process.env.TEST_STORAGE_URL}/test-storage-stats`, { headers: { Authorization: `Bearer ${process.env.TEST_SERVICE_KEY}` } })).json();
+}
+async function upload(petId, identity, bytes, name = "report.pdf", mime = "application/pdf", extra) {
+  const form = new FormData(); form.set("file", new Blob([bytes], { type: mime }), name);
+  if (extra) form.set("ownerId", "forged");
+  return fetch(`${base}/api/pets/${petId}/documents`, { method: "POST", headers: { Origin: base, ...(identity ? { Cookie: sessionCookie(tokens[identity]) } : {}) }, body: form });
+}
+await test("private medical documents and recoverable Storage failures", async t => {
+  const a = await pet(await api("POST", "/api/pets", "a", { name: "Document pet", species: "Dog" }));
+  const b = await pet(await api("POST", "/api/pets", "b", { name: "Other document pet", species: "Cat" }));
+  const pdf = new TextEncoder().encode("%PDF-1.7\nPrivate medical fixture"); let document;
+  await t.test("uploads privately with non-guessable paths and authorizes list/preview/download/delete", async () => {
+    const response = await upload(a.id, "a", pdf); assert.equal(response.status, 201);
+    document = (await response.json()).document;
+    assert.equal(document.sizeBytes, pdf.length); assert.equal("storagePath" in document, false);
+    const path = `/api/pets/${a.id}/documents/${document.id}`;
+    assert.equal((await api("GET", `/api/pets/${a.id}/documents`, "a")).status, 200);
+    for (const [method,url] of [["GET",path], ["GET",`${path}?download=1`], ["DELETE",path], ["GET",`/api/pets/${a.id}/documents`]]) {
+      assert.equal((await api(method,url,"b")).status, 404);
+      assert.equal((await api(method,url)).status, 401);
+    }
+    assert.equal((await upload(a.id,"b",pdf)).status, 404);
+    assert.equal((await upload(a.id,undefined,pdf)).status, 401);
+    assert.equal((await api("GET", `/api/pets/${b.id}/documents/${document.id}`, "b")).status, 404);
+    assert.equal((await api("GET", "/api/documents")).status, 401);
+    assert.deepEqual((await (await api("GET", "/api/documents", "b")).json()).documents, []);
+    const signedResponse = await api("GET", path, "a"); const signed = await signedResponse.json();
+    assert.equal(signed.expiresIn, 60); assert.match(signedResponse.headers.get("cache-control"), /no-store/);
+    const signedUrl = new URL(signed.url); assert.match(signedUrl.pathname, new RegExp(`${process.env.TEST_OWNER_A}/${a.id}/[0-9a-f-]+\\.pdf`));
+    const preview = await fetch(signed.url); assert.equal(preview.status, 200); assert.deepEqual(new Uint8Array(await preview.arrayBuffer()), pdf);
+    const download = await api("GET", `${path}?download=1`, "a"); assert.equal(download.status, 200); assert.match((await download.json()).url, /download=/);
+    const privatePath = signed.url.split("?")[0].replace("/object/sign/", "/object/authenticated/");
+    assert.equal((await fetch(privatePath,{headers:{Authorization:`Bearer ${tokens.b}`}})).status,403);
+    assert.equal((await fetch(privatePath,{headers:{Authorization:`Bearer ${tokens.a}`}})).status,200);
+    const publicPath = signed.url.replace("/object/sign/", "/object/public/"); assert.equal((await fetch(publicPath)).status, 403);
+    const listed = (await (await api("GET", "/api/documents", "a")).json()).documents;
+    assert.equal(listed.some(record => record.id === document.id), true);
+  });
+  await t.test("invalid, spoofed, oversized and forged-parent uploads do not reach Storage", async () => {
+    const before = (await storageStats()).count;
+    assert.equal((await upload(a.id,"a",pdf,"spoof.png","image/png")).status, 422);
+    assert.equal((await upload(a.id,"a",new TextEncoder().encode("<svg/>"),"bad.svg","image/svg+xml")).status, 422);
+    assert.equal((await upload(a.id,"a",new Uint8Array(),"empty.pdf")).status, 422);
+    assert.equal((await upload(a.id,"a",pdf,"report.pdf","application/pdf",true)).status, 422);
+    const huge = new Uint8Array(10*1024*1024+1); huge.set(pdf);
+    assert.equal((await upload(a.id,"a",huge,"large.pdf")).status, 413);
+    assert.equal((await storageStats()).count, before);
+  });
+  await t.test("exactly 10 MB and the other allowed signatures are supported", async () => {
+    const full = new Uint8Array(10*1024*1024); full.set(pdf);
+    const large = await upload(a.id,"a",full,"full.pdf"); assert.equal(large.status, 201);
+    const largeDoc = (await large.json()).document;
+    assert.equal((await api("DELETE",`/api/pets/${a.id}/documents/${largeDoc.id}`,"a")).status,200);
+    for (const [bytes,name,mime] of [[new Uint8Array([255,216,255,0]),"image.jpg","image/jpeg"], [new Uint8Array([137,80,78,71,13,10,26,10]),"image.png","image/png"], [new TextEncoder().encode("RIFF1234WEBP"),"image.webp","image/webp"]]) {
+      const created = await upload(a.id,"a",bytes,name,mime); assert.equal(created.status,201);
+      const record = (await created.json()).document;
+      assert.equal((await api("DELETE",`/api/pets/${a.id}/documents/${record.id}`,"a")).status,200);
+    }
+  });
+  await t.test("uncertain failed uploads, database-finalize failures, and failed deletes recover via cron", async () => {
+    const before = (await storageStats()).count;
+    const uncertain = await upload(a.id,"a",new TextEncoder().encode("%PDF-1.7 FAIL_UPLOAD FAIL_DELETE_ONCE"),"uncertain.pdf"); assert.equal(uncertain.status,502);
+    assert.equal((await storageStats()).count,before+1);
+    const job = await cron(); assert.equal(job.status,200); assert.ok((await job.json()).cleanup.removed >= 1);
+    assert.equal((await storageStats()).count,before);
+    const dbFail = await upload(a.id,"a",pdf,"db-fail.pdf"); assert.equal(dbFail.status,502); assert.equal((await storageStats()).count,before);
+    const failedDelete = await upload(a.id,"a",new TextEncoder().encode("%PDF-1.7 FAIL_DELETE_ONCE"),"retry.pdf"); assert.equal(failedDelete.status,201);
+    const record = (await failedDelete.json()).document; const path=`/api/pets/${a.id}/documents/${record.id}`;
+    assert.equal((await api("DELETE",path,"a")).status,202);
+    assert.equal((await api("GET",path,"a")).status,404);
+    assert.equal((await (await api("GET","/api/documents","a")).json()).documents.some(r=>r.id===record.id),false);
+    await cron(); assert.equal((await storageStats()).count,before);
+  });
+  await t.test("document inventory survives pet deletion and the worker removes orphaned objects", async () => {
+    assert.equal((await api("GET","/documents","a")).status,200);
+    assert.equal((await api("DELETE",`/api/pets/${a.id}`,"a")).status,204);
+    assert.equal((await api("GET",`/api/pets/${a.id}/documents/${document.id}`,"a")).status,404);
+    const job=await cron(); assert.equal(job.status,200);
+    assert.equal((await storageStats()).count,0);
+    const repeat=await cron(); assert.equal(repeat.status,200);
+  });
+  await api("DELETE",`/api/pets/${b.id}`,"b");
+});

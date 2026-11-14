@@ -1,12 +1,16 @@
 # PawTrack
 
-A pet health workspace built with Next.js App Router, strict TypeScript, Tailwind CSS, shadcn/ui-style source components, Prisma/PostgreSQL, and Supabase Auth. Supports owner-scoped pet profiles, dated weights, vaccinations, vet visits, and medications. The public `/preview` is explicitly sample UI, isolated from the database; it is never an authentication bypass.
+A pet health workspace built with Next.js App Router, strict TypeScript, Tailwind CSS, shadcn/ui-style source components, Prisma/PostgreSQL, and Supabase Auth. Supports owner-scoped pet profiles, health records, persistent care reminders, and private medical documents. The public `/preview` is explicitly sample UI, isolated from the database; it is never an authentication bypass.
+
+## Phase 3 setup
+
+Read [Phase 3 local setup and verification](docs/phase3-local-setup.md) before running the new features. The new migration, private bucket, Storage policies, and server-only cron/cleanup keys require manual setup. No hosted migration or deployment was performed.
 
 ## Requirements
 
 - Node.js 22.12+ (Node 24 recommended; `.nvmrc` included), npm
 - A Supabase project with email/password Auth and PostgreSQL
-- No service-role key is needed or used.
+- The server-side Storage cleanup worker needs a service-role key in Phase 3; normal user operations use session-based RLS.
 
 ## Local setup
 
@@ -61,7 +65,7 @@ Every API method validates the session with Supabase `getUser()`. All individual
 
 The initial migration enables RLS on every application table with no public policies. Direct Supabase anonymous/authenticated Data API access is therefore denied. Prisma must use the server-only database role from Supabase Connect (normally `postgres`, which bypasses RLS). App ownership checks are the authorization boundary for those privileged server queries. Do not expose database credentials or add broad public RLS policies. Health-record routes authorize through the parent pet on every read and write. Account deletion/cleanup is not implemented; deleting an Auth user does not automatically remove its separate app profile.
 
-Photo URLs are optional HTTPS links displayed by the browser with unoptimized Next Image; the server never fetches them. File uploads are intentionally absent. The reserved storage bucket variable is not required for Phase 1. Before uploads, create a **private** bucket and owner-based Storage policies; never make medical files public.
+Photo URLs are optional HTTPS links displayed by the browser with unoptimized Next Image; the server never fetches them. Phase 3 implements private file uploads; follow the Phase 3 setup guide. Phase 3 uses the fixed private bucket name pet-documents. Before uploads, create a **private** bucket and owner-based Storage policies; never make medical files public.
 
 ## Verification boundary and acceptance checks
 
@@ -82,7 +86,7 @@ Import the repository into Vercel, use Node 24, set the same environment variabl
 
 ## Future phases
 
-Health-record CRUD and ownership integration tests are implemented in Phase 2 (details below). Future work includes reminder delivery and private medical document uploads with per-owner policies, file validation, signed download URLs, and cleanup.
+Phase 3 implements in-app reminders and private documents. Email/SMS delivery remains unimplemented, and Vercel deployment remains manual. See the Phase 3 setup guide for the upload transport change required before a future Vercel deployment.
 
 ## Local verification (2026-11-11)
 

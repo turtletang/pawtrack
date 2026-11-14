@@ -41,3 +41,7 @@ export async function deletePet(id: string, ownerId: string) {
   const result = await db().pet.deleteMany({ where: ownedPetWhere(id, ownerId) });
   if (!result.count) throw new HttpError(404, "Pet not found.");
 }
+
+export async function requireOwnedPet(petId: string, ownerId: string) {
+  if (!await db().pet.findFirst({ where: ownedPetWhere(petId, ownerId), select: { id: true } })) throw new HttpError(404, "Pet not found.");
+}
