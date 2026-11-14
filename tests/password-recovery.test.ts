@@ -24,24 +24,24 @@ test("validates recovery addresses and matching password bounds on the server", 
 });
 
 test("constructs a fixed localhost callback and rejects unsafe configuration", () => {
-  assert.equal(recoveryRedirectUrl(), "http://localhost:3000/auth/recovery");
+  assert.equal(recoveryRedirectUrl("http://localhost:3000"), "http://localhost:3000/auth/recovery");
   assert.equal(recoveryRedirectUrl("https://pawtrack.example"), "https://pawtrack.example/auth/recovery");
   for (const value of ["http://example.com", "javascript:alert(1)", "https://user:password@example.com", "https://example.com/evil", "https://example.com?next=evil"]) assert.throws(() => recoveryRedirectUrl(value));
 });
 
 test("sends the recovery request with a fixed callback and does not disclose account existence", async () => {
   const valid = fakeAuth();
-  const success = await sendRecoveryEmail(valid.auth, "parent@example.com", recoveryRedirectUrl());
+  const success = await sendRecoveryEmail(valid.auth, "parent@example.com", recoveryRedirectUrl("http://localhost:3000"));
   assert.deepEqual(valid.calls[0], { method: "resetPasswordForEmail", args: ["parent@example.com", { redirectTo: "http://localhost:3000/auth/recovery" }] });
   const unknown = fakeAuth({ resetPasswordForEmail: { error: { status: 400, message: "Account not found" } } });
-  assert.deepEqual(await sendRecoveryEmail(unknown.auth, "unknown@example.com", recoveryRedirectUrl()), success);
+  assert.deepEqual(await sendRecoveryEmail(unknown.auth, "unknown@example.com", recoveryRedirectUrl("http://localhost:3000")), success);
 });
 
 test("handles recovery throttling and network failures", async () => {
   const throttled = fakeAuth({ resetPasswordForEmail: { error: { status: 429 } } });
-  assert.match((await sendRecoveryEmail(throttled.auth, "a@example.com", recoveryRedirectUrl())).error!, /Too many/);
+  assert.match((await sendRecoveryEmail(throttled.auth, "a@example.com", recoveryRedirectUrl("http://localhost:3000"))).error!, /Too many/);
   const offline = fakeAuth({ resetPasswordForEmail: new Error("network") });
-  assert.match((await sendRecoveryEmail(offline.auth, "a@example.com", recoveryRedirectUrl())).error!, /connect/);
+  assert.match((await sendRecoveryEmail(offline.auth, "a@example.com", recoveryRedirectUrl("http://localhost:3000"))).error!, /connect/);
 });
 
 test("exchanges recovery codes with flow IDs and ignores arbitrary redirect destinations", async () => {

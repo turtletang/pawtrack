@@ -44,7 +44,7 @@ const serviceKey = "fixture-service-key-" + randomBytes(24).toString("hex");
 const handleStorage = storageFixture({ identities, serviceKey, database: () => database });
 auth.on("request", async (request, response) => {
   response.setHeader("Content-Type", "application/json");
-  if (request.url.startsWith("/storage/v1/") || request.url.startsWith("/test-storage-stats")) { await handleStorage(request, response); return; }
+  if (request.url.startsWith("/storage/v1/") || request.url.startsWith("/test-storage-")) { await handleStorage(request, response); return; }
   if (request.url === "/auth/v1/user" && request.method === "GET") {
     const id = identities.get(request.headers.authorization?.replace(/^Bearer /, ""));
     response.statusCode = id ? 200 : 401;
@@ -72,7 +72,7 @@ try {
   const authUrl = `http://127.0.0.1:${auth.address().port}`;
   // New cluster, loopback only, unrelated to any existing local or hosted database.
   await run(join(pgBin, "initdb"), ["-D", dataDir, "-U", "pawtrack_test", "-A", "trust", "--no-locale", "--encoding=UTF8"]);
-  await run(join(pgBin, "pg_ctl"), ["-D", dataDir, "-l", join(directory, "postgres.log"), "-o", `-h 127.0.0.1 -p ${pgPort} -k ${directory}`, "-w", "start"]);
+  await run(join(pgBin, "pg_ctl"), ["-D", dataDir, "-l", join(directory, "postgres.log"), "-o", `-c timezone=UTC -h 127.0.0.1 -p ${pgPort} -k ${directory}`, "-w", "start"]);
   postgresStarted = true;
   const databaseUrl = `postgresql://pawtrack_test@127.0.0.1:${pgPort}/postgres`;
   database = new pg.Pool({ connectionString: databaseUrl });
@@ -123,7 +123,7 @@ try {
     NEXT_PUBLIC_SUPABASE_URL: authUrl, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "integration-test-only",
     CRON_SECRET: cronSecret, SUPABASE_SERVICE_ROLE_KEY: serviceKey, SUPABASE_STORAGE_BUCKET: "pet-documents",
     TEST_CRON_SECRET: cronSecret, TEST_STORAGE_URL: authUrl, TEST_SERVICE_KEY: serviceKey,
-    APP_URL: "http://localhost:3000", PAWTRACK_INTEGRATION_TEST: "1", NEXT_TELEMETRY_DISABLED: "1",
+    VERCEL: "", APP_URL: "http://localhost:3000", PAWTRACK_INTEGRATION_TEST: "1", NEXT_TELEMETRY_DISABLED: "1",
     // The application never consumes these fixture identity variables.
     TEST_BASE_URL: baseUrl, TEST_TOKEN_A: tokenA, TEST_TOKEN_B: tokenB, TEST_OWNER_A: ownerA, TEST_OWNER_B: ownerB };
   await run(process.execPath, ["node_modules/prisma/build/index.js", "generate"], env);

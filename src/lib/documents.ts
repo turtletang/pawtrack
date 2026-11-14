@@ -1,3 +1,4 @@
+import { z } from "zod";
 export const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
 export const DOCUMENT_BUCKET = "pet-documents";
 export const SIGNED_URL_SECONDS = 60;
@@ -19,4 +20,18 @@ export function validateDocument(name: string, claimedType: string, bytes: Uint8
   const cleanName = name.replace(/[\\/\u0000-\u001f\u007f]/g, "_").trim();
   if (!cleanName || cleanName.length > 160) throw new Error("Use a filename between 1 and 160 characters.");
   return { name: cleanName, mimeType, extension: documentTypes[mimeType] };
+}
+
+export const UPLOAD_RESERVATION_MS = 15 * 60_000;
+// Supabase signed upload grants last two hours. Keep staging inventory beyond token expiry.
+export const STAGING_GRANT_MS = (2 * 60 * 60 + 5 * 60) * 1000;
+export const documentUploadSchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  mimeType: z.enum(["application/pdf", "image/jpeg", "image/png", "image/webp"]),
+  sizeBytes: z.number().int().positive().max(MAX_DOCUMENT_BYTES),
+}).strict().transform(value => ({ ...value, name: value.name.replace(/[\\/\u0000-\u001f\u007f]/g, "_") }));
+export function stagingPath(ownerId: string, petId: string, id: string, mimeType: string) {
+  const extension = documentTypes[mimeType as DocumentMime];
+  if (!extension) throw new Error("Unsupported document type.");
+  return `${ownerId}/${petId}/staging/${id}.${extension}`;
 }

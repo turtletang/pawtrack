@@ -2,9 +2,13 @@
 
 A pet health workspace built with Next.js App Router, strict TypeScript, Tailwind CSS, shadcn/ui-style source components, Prisma/PostgreSQL, and Supabase Auth. Supports owner-scoped pet profiles, health records, persistent care reminders, and private medical documents. The public `/preview` is explicitly sample UI, isolated from the database; it is never an authentication bypass.
 
+## Phase 4 deployment preparation
+
+Start with [Vercel deployment and production checklist](docs/vercel-deployment.md). Direct private Storage uploads preserve the 10 MB limit without sending file bodies through Vercel. The enum migration, updated Storage helper, production environment and Auth settings require manual review/configuration. No deployment or hosted change was performed.
+
 ## Phase 3 setup
 
-Read [Phase 3 local setup and verification](docs/phase3-local-setup.md) before running the new features. The new migration, private bucket, Storage policies, and server-only cron/cleanup keys require manual setup. No hosted migration or deployment was performed.
+The [Phase 3 guide](docs/phase3-local-setup.md) documents the earlier multipart implementation; use the Phase 4 guide above for the current upload protocol. The new migration, private bucket, Storage policies, and server-only cron/cleanup keys require manual setup. No hosted migration or deployment was performed.
 
 ## Requirements
 

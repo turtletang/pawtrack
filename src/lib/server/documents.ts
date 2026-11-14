@@ -1,8 +1,9 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import { supabaseUrl } from "@/lib/supabase/config";
 import { createClient } from "@/lib/supabase/server";
-import { DOCUMENT_BUCKET, MAX_DOCUMENT_BYTES, SIGNED_URL_SECONDS, validateDocument, type DocumentView } from "@/lib/documents";
+import { DOCUMENT_BUCKET, MAX_DOCUMENT_BYTES, SIGNED_URL_SECONDS, validateDocument, documentUploadSchema, documentTypes, stagingPath, UPLOAD_RESERVATION_MS, STAGING_GRANT_MS, type DocumentView } from "@/lib/documents";
 import { db } from "./db";
 import { HttpError } from "./http";
 import { requireOwnedPet } from "./pets";
@@ -20,61 +21,109 @@ async function ownedDocument(id: string, petId: string, ownerId: string, readyOn
   if (!record) throw new HttpError(404, "Document not found.");
   return record;
 }
-export async function documentFile(request: Request) {
-  const contentType = request.headers.get("content-type") || "";
-  if (!/^multipart\/form-data;/i.test(contentType)) throw new HttpError(415, "Expected a multipart file upload.");
-  const limit = MAX_DOCUMENT_BYTES + 65536;
-  if (Number(request.headers.get("content-length")) > limit) throw new HttpError(413, "Maximum file size is 10 MB.");
-  const reader = request.body?.getReader(); if (!reader) throw new HttpError(400, "Choose a file.");
-  let size = 0; const chunks: Uint8Array[] = [];
+function adminStorage(timeout = 20000, deadline = Date.now()+45000) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) throw new HttpError(503, "Private document processing is not configured.");
+  return createSupabaseClient(supabaseUrl(), key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(Math.max(1, Math.min(timeout, deadline-Date.now()))) }) },
+  }).storage.from(DOCUMENT_BUCKET);
+}
+async function queueDocumentCleanup(record: Document, ownerId: string) {
+  // Staging grants cannot be revoked individually: preserve their original expiry grace.
+  const paths = [record.storagePath, stagingPath(ownerId, record.petId, record.id, record.mimeType)];
+  await db().$transaction(async tx => {
+    await tx.document.updateMany({ where: { id: record.id, pet: { ownerId } }, data: { status: "DELETING" } });
+    await tx.storageObject.updateMany({ where: { path: paths[0], ownerId }, data: { status: "DELETING", leaseUntil: new Date() } });
+    await tx.storageObject.updateMany({ where: { path: paths[1], ownerId }, data: { status: "DELETING" } });
+  });
+  return paths;
+}
+export async function reserveDocument(petId: string, ownerId: string, body: unknown) {
+  await requireOwnedPet(petId, ownerId);
+  adminStorage(); // Fail before reserving if server-side verification cannot run.
+  const parsed = documentUploadSchema.safeParse(body);
+  if (!parsed.success) throw new HttpError(422, "Choose a supported file with a valid name and size between 1 byte and 10 MB.");
+  const file = parsed.data; const id = randomUUID();
+  const path = `${ownerId}/${petId}/${id}.${documentTypes[file.mimeType]}`;
+  const staging = stagingPath(ownerId, petId, id, file.mimeType);
+  const record = await db().$transaction(async tx => {
+    await tx.storageObject.createMany({ data: [
+      { id, path, petId, ownerId, leaseUntil: new Date(Date.now()+UPLOAD_RESERVATION_MS) },
+      { id: randomUUID(), path: staging, petId, ownerId, leaseUntil: new Date(Date.now()+STAGING_GRANT_MS) },
+    ] });
+    return tx.document.create({ data: { id, storagePath: path, ...file, status: "UPLOADING", pet: { connect: { id: petId, ownerId } } } });
+  });
+  try {
+    const { data, error } = await (await createClient(20000)).storage.from(DOCUMENT_BUCKET).createSignedUploadUrl(staging, { upsert: false });
+    if (error || !data?.signedUrl) throw new Error("Upload grant failed");
+    return { documentId: id, url: data.signedUrl, expiresIn: 7200, reservationExpiresIn: UPLOAD_RESERVATION_MS/1000 };
+  } catch {
+    try { await queueDocumentCleanup(record, ownerId); } catch { /* Original leases remain durable. */ }
+    throw new HttpError(502, "Couldn't prepare a private upload. Please try again.");
+  }
+}
+async function stagedBytes(path: string, deadline: number) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) throw new HttpError(503, "Private document processing is not configured.");
+  const url = `${supabaseUrl()}/storage/v1/object/authenticated/${DOCUMENT_BUCKET}/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(url, { headers: { apikey: key, Authorization: `Bearer ${key}` }, cache: "no-store", signal: AbortSignal.timeout(Math.max(1,Math.min(20000,deadline-Date.now()))) });
+  if (!response.ok || !response.body) throw new HttpError(502, "The staged file couldn't be read. Please upload it again.");
+  if (Number(response.headers.get("content-length")) > MAX_DOCUMENT_BYTES) { await response.body.cancel(); throw new HttpError(413, "Maximum file size is 10 MB."); }
+  const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
   for (;;) {
     const { done, value } = await reader.read(); if (done) break;
     size += value.byteLength;
-    if (size > limit) { await reader.cancel(); throw new HttpError(413, "Maximum file size is 10 MB."); }
+    if (size > MAX_DOCUMENT_BYTES) { await reader.cancel(); throw new HttpError(413, "Maximum file size is 10 MB."); }
     chunks.push(value);
   }
-  let form: FormData;
-  try { form = await new Response(Buffer.concat(chunks), { headers: { "Content-Type": contentType } }).formData(); }
-  catch { throw new HttpError(400, "Invalid file upload."); }
-  const entries = [...form.entries()];
-  if (entries.length !== 1 || entries[0][0] !== "file" || !(entries[0][1] instanceof File)) throw new HttpError(422, "Upload one file in the file field.");
-  const file = entries[0][1];
-  if (file.size > MAX_DOCUMENT_BYTES) throw new HttpError(413, "Maximum file size is 10 MB.");
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  try { return { ...validateDocument(file.name, file.type, bytes), bytes }; }
-  catch (error) { throw new HttpError(422, error instanceof Error ? error.message : "Invalid document."); }
+  return { bytes: new Uint8Array(Buffer.concat(chunks)), mimeType: response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() };
 }
-export async function uploadDocument(request: Request, petId: string, ownerId: string) {
-  await requireOwnedPet(petId, ownerId);
-  const file = await documentFile(request); const id = randomUUID();
-  const path = `${ownerId}/${petId}/${id}.${file.extension}`;
-  const leaseUntil = new Date(Date.now() + 15 * 60_000);
-  // Inventory survives pet/document cascades; no storage write occurs before it is durable.
-  await db().$transaction(async tx => {
-    await tx.storageObject.create({ data: { id, path, petId, ownerId, leaseUntil } });
-    await tx.document.create({ data: { id, storagePath: path, name: file.name, mimeType: file.mimeType, sizeBytes: file.bytes.length, status: "UPLOADING", pet: { connect: { id: petId, ownerId } } } });
+export async function completeDocument(id: string, petId: string, ownerId: string) {
+  const deadline = Date.now()+45000;
+  const record = await ownedDocument(id, petId, ownerId, false);
+  if (record.status === "READY") return view(await db().document.findUniqueOrThrow({ where: { id }, include: { pet: { select: { name: true } } } }));
+  if (record.status !== "UPLOADING") throw new HttpError(409, "This upload is unavailable or already being verified. Refresh before retrying.");
+  const storage = adminStorage(20000,deadline);
+  const claimed = await db().$transaction(async tx => {
+    const lease = await tx.storageObject.updateMany({ where: { id, ownerId, status: "UPLOADING", leaseUntil: { gt: new Date() } }, data: { status: "VERIFYING", leaseUntil: new Date(Date.now()+5*60_000) } });
+    if (!lease.count) throw new HttpError(409, "The upload reservation expired or is already being verified.");
+    const changed = await tx.document.updateMany({ where: { id, petId, pet: { ownerId }, status: "UPLOADING" }, data: { status: "VERIFYING" } });
+    if (!changed.count) throw new HttpError(409, "This upload is no longer available.");
+    return true;
   });
-  const storage = (await createClient(30000)).storage.from(DOCUMENT_BUCKET);
+  if (!claimed) throw new HttpError(409, "Unable to claim upload.");
+  const staging = stagingPath(ownerId, petId, id, record.mimeType);
   try {
-    const uploaded = await storage.upload(path, file.bytes, { contentType: file.mimeType, upsert: false, cacheControl: "0" });
-    if (uploaded.error) throw new Error("Storage upload failed");
-    return await db().$transaction(async tx => {
-      const inventory = await tx.storageObject.updateMany({ where: { id, status: "UPLOADING", leaseUntil: { gt: new Date() } }, data: { status: "READY" } });
-      const document = await tx.document.updateMany({ where: { id, petId, pet: { ownerId }, status: "UPLOADING" }, data: { status: "READY" } });
-      if (!inventory.count || !document.count) throw new Error("Upload lease no longer valid");
+    const file = await stagedBytes(staging,deadline);
+    if (file.bytes.length !== record.sizeBytes || file.mimeType !== record.mimeType) throw new HttpError(422, "The uploaded file doesn't match its reserved size or type.");
+    try { validateDocument(record.name, record.mimeType, file.bytes); }
+    catch (error) { throw new HttpError(422, error instanceof Error ? error.message : "Invalid document."); }
+    // Publish the validated byte snapshot to a different key. No browser receives a grant
+    // for this final key, and user RLS denies all final-key inserts/overwrites.
+    const uploaded = await storage.upload(record.storagePath, file.bytes, { contentType: record.mimeType, upsert: false, cacheControl: "0" });
+    if (uploaded.error) throw new HttpError(502, "The validated document couldn't be saved.");
+    const result = await db().$transaction(async tx => {
+      const inventory = await tx.storageObject.updateMany({ where: { id, status: "VERIFYING", leaseUntil: { gt: new Date() } }, data: { status: "READY" } });
+      const document = await tx.document.updateMany({ where: { id, petId, pet: { ownerId }, status: "VERIFYING" }, data: { status: "READY" } });
+      if (!inventory.count || !document.count) throw new Error("Upload claim no longer valid");
+      await tx.storageObject.updateMany({ where: { path: staging, ownerId }, data: { status: "DELETING" } });
       return view(await tx.document.findUniqueOrThrow({ where: { id }, include: { pet: { select: { name: true } } } }));
     });
-  } catch {
-    // If DB or Storage is unavailable, the original inventory row remains recoverable by cron.
+    try { await adminStorage(5000,deadline).remove([staging]); } catch { /* Inventory retries after the upload grant expires. */ }
+    return result;
+  } catch (error) {
+    // A lost commit acknowledgment must not delete an already published, valid document.
     try {
-      await db().$transaction([
-        db().document.updateMany({ where: { id }, data: { status: "DELETING" } }),
-        db().storageObject.updateMany({ where: { id }, data: { status: "DELETING", leaseUntil: new Date() } }),
-      ]);
-      const removed = await storage.remove([path]);
-      if (!removed.error) await db().document.deleteMany({ where: { id, status: "DELETING" } });
-    } catch { /* Retain inventory for retry, including uncertain upload outcomes. */ }
-    throw new HttpError(502, "The document couldn't be saved. Please try again. Any partial upload is queued for cleanup.");
+      const published = await db().document.findFirst({ where: { id, petId, pet: { ownerId }, status: "READY" }, include: { pet: { select: { name: true } } } });
+      if (published) return view(published);
+    } catch { /* A later retry can resolve an uncertain commit using the durable state. */ }
+    try {
+      const paths = await queueDocumentCleanup(record, ownerId);
+      await storage.remove(paths);
+    } catch { /* Durable inventory retries uncertain Storage/DB outcomes. */ }
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(502, "The document couldn't be verified. Any partial objects are queued for cleanup.");
   }
 }
 export async function signedDocument(id: string, petId: string, ownerId: string, download: boolean) {
@@ -89,6 +138,8 @@ export async function deleteDocument(id: string, petId: string, ownerId: string)
     await tx.document.updateMany({ where: { id, petId, pet: { ownerId } }, data: { status: "DELETING" } });
     await tx.storageObject.upsert({ where: { path: record.storagePath }, create: { id, path: record.storagePath, petId, ownerId, status: "DELETING", leaseUntil: new Date() }, update: { status: "DELETING", leaseUntil: new Date() } });
   });
+  const staging = documentTypes[record.mimeType as keyof typeof documentTypes] ? stagingPath(ownerId, petId, id, record.mimeType) : null;
+  if (staging) await db().storageObject.updateMany({ where: { path: staging, ownerId }, data: { status: "DELETING" } });
   try {
     const { error } = await (await createClient(30000)).storage.from(DOCUMENT_BUCKET).remove([record.storagePath]);
     if (error) return { pending: true };
@@ -99,12 +150,12 @@ export async function deleteDocument(id: string, petId: string, ownerId: string)
 export async function cleanupStorage(deadline = Date.now() + 45000) {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!key || Date.now()+10000 > deadline) return { skipped: true, removed: 0, failed: 0 };
-  const storage = createSupabaseClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, key, {
+  const storage = createSupabaseClient(supabaseUrl(), key, {
     auth: { persistSession: false, autoRefreshToken: false }, global: { fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(10000) }) },
   }).storage.from(DOCUMENT_BUCKET);
   const inventory = await db().$transaction(async tx => {
     const rows = await tx.$queryRaw<StorageObject[]>`SELECT s.* FROM "StorageObject" s LEFT JOIN "Document" d ON d."storagePath" = s.path
-      WHERE (s.status IN ('UPLOADING', 'DELETING') AND s."leaseUntil" <= CURRENT_TIMESTAMP) OR (s.status = 'READY' AND d.id IS NULL)
+      WHERE (s.status IN ('UPLOADING', 'VERIFYING', 'DELETING') AND s."leaseUntil" <= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')) OR (s.status = 'READY' AND d.id IS NULL)
       ORDER BY s."leaseUntil", s.id LIMIT 25 FOR UPDATE OF s SKIP LOCKED`;
     for (const row of rows) {
       await tx.storageObject.update({ where: { id: row.id }, data: { status: "DELETING", leaseUntil: new Date(Date.now()+5*60_000) } });

@@ -288,11 +288,22 @@ await test("persistent reminders and idempotent scheduled processing", async t =
 async function storageStats() {
   return (await fetch(`${process.env.TEST_STORAGE_URL}/test-storage-stats`, { headers: { Authorization: `Bearer ${process.env.TEST_SERVICE_KEY}` } })).json();
 }
-async function upload(petId, identity, bytes, name = "report.pdf", mime = "application/pdf", extra) {
-  const form = new FormData(); form.set("file", new Blob([bytes], { type: mime }), name);
-  if (extra) form.set("ownerId", "forged");
-  return fetch(`${base}/api/pets/${petId}/documents`, { method: "POST", headers: { Origin: base, ...(identity ? { Cookie: sessionCookie(tokens[identity]) } : {}) }, body: form });
+async function expireUploads() {
+  const response = await fetch(`${process.env.TEST_STORAGE_URL}/test-storage-expire`, { headers: { Authorization: `Bearer ${process.env.TEST_SERVICE_KEY}` } });
+  assert.equal(response.status,200);
 }
+async function reserve(petId, identity, name, mimeType, sizeBytes, extra = {}) {
+  return api("POST",`/api/pets/${petId}/documents`,identity,{name,mimeType,sizeBytes,...extra});
+}
+async function upload(petId, identity, bytes, name = "report.pdf", mime = "application/pdf", extra) {
+  const reservation = await reserve(petId,identity,name,mime,bytes.length,extra ? {ownerId:"forged"} : {});
+  if (!reservation.ok) return reservation;
+  const {upload} = await reservation.json();
+  const sent = await fetch(upload.url,{method:"PUT",headers:{"Content-Type":mime,"x-upsert":"false"},body:bytes});
+  if (!sent.ok) { await api("DELETE",`/api/pets/${petId}/documents/${upload.documentId}`,identity); return sent; }
+  return api("POST",`/api/pets/${petId}/documents/${upload.documentId}/complete`,identity,{});
+}
+
 await test("private medical documents and recoverable Storage failures", async t => {
   const a = await pet(await api("POST", "/api/pets", "a", { name: "Document pet", species: "Dog" }));
   const b = await pet(await api("POST", "/api/pets", "b", { name: "Other document pet", species: "Cat" }));
@@ -300,6 +311,8 @@ await test("private medical documents and recoverable Storage failures", async t
   await t.test("uploads privately with non-guessable paths and authorizes list/preview/download/delete", async () => {
     const response = await upload(a.id, "a", pdf); assert.equal(response.status, 201);
     document = (await response.json()).document;
+    const repeated = await api("POST", `/api/pets/${a.id}/documents/${document.id}/complete`,"a",{});
+    assert.equal(repeated.status,201); assert.deepEqual((await repeated.json()).document,document);
     assert.equal(document.sizeBytes, pdf.length); assert.equal("storagePath" in document, false);
     const path = `/api/pets/${a.id}/documents/${document.id}`;
     assert.equal((await api("GET", `/api/pets/${a.id}/documents`, "a")).status, 200);
@@ -311,6 +324,8 @@ await test("private medical documents and recoverable Storage failures", async t
     assert.equal((await upload(a.id,undefined,pdf)).status, 401);
     assert.equal((await api("GET", `/api/pets/${b.id}/documents/${document.id}`, "b")).status, 404);
     assert.equal((await api("GET", "/api/documents")).status, 401);
+    assert.equal((await api("POST", `${path}/complete`, "b", {})).status,404);
+    assert.equal((await api("POST", `${path}/complete`, undefined, {})).status,401);
     assert.deepEqual((await (await api("GET", "/api/documents", "b")).json()).documents, []);
     const signedResponse = await api("GET", path, "a"); const signed = await signedResponse.json();
     assert.equal(signed.expiresIn, 60); assert.match(signedResponse.headers.get("cache-control"), /no-store/);
@@ -331,7 +346,8 @@ await test("private medical documents and recoverable Storage failures", async t
     assert.equal((await upload(a.id,"a",new Uint8Array(),"empty.pdf")).status, 422);
     assert.equal((await upload(a.id,"a",pdf,"report.pdf","application/pdf",true)).status, 422);
     const huge = new Uint8Array(10*1024*1024+1); huge.set(pdf);
-    assert.equal((await upload(a.id,"a",huge,"large.pdf")).status, 413);
+    assert.equal((await upload(a.id,"a",huge,"large.pdf")).status, 422);
+    await expireUploads(); await cron();
     assert.equal((await storageStats()).count, before);
   });
   await t.test("exactly 10 MB and the other allowed signatures are supported", async () => {
@@ -347,9 +363,11 @@ await test("private medical documents and recoverable Storage failures", async t
   });
   await t.test("uncertain failed uploads, database-finalize failures, and failed deletes recover via cron", async () => {
     const before = (await storageStats()).count;
-    const uncertain = await upload(a.id,"a",new TextEncoder().encode("%PDF-1.7 FAIL_UPLOAD FAIL_DELETE_ONCE"),"uncertain.pdf"); assert.equal(uncertain.status,502);
+    const uncertain = await upload(a.id,"a",new TextEncoder().encode("%PDF-1.7 FAIL_UPLOAD FAIL_DELETE_ONCE"),"uncertain.pdf"); assert.equal(uncertain.status,500);
     assert.equal((await storageStats()).count,before+1);
-    const job = await cron(); assert.equal(job.status,200); assert.ok((await job.json()).cleanup.removed >= 1);
+    await expireUploads();
+    const job = await cron(); assert.equal(job.status,200); assert.ok((await job.json()).cleanup.failed >= 1);
+    await expireUploads(); await cron();
     assert.equal((await storageStats()).count,before);
     const dbFail = await upload(a.id,"a",pdf,"db-fail.pdf"); assert.equal(dbFail.status,502); assert.equal((await storageStats()).count,before);
     const failedDelete = await upload(a.id,"a",new TextEncoder().encode("%PDF-1.7 FAIL_DELETE_ONCE"),"retry.pdf"); assert.equal(failedDelete.status,201);
@@ -357,12 +375,60 @@ await test("private medical documents and recoverable Storage failures", async t
     assert.equal((await api("DELETE",path,"a")).status,202);
     assert.equal((await api("GET",path,"a")).status,404);
     assert.equal((await (await api("GET","/api/documents","a")).json()).documents.some(r=>r.id===record.id),false);
-    await cron(); assert.equal((await storageStats()).count,before);
+    await expireUploads(); await cron(); assert.equal((await storageStats()).count,before);
+  });
+  await t.test("staging grants are scoped and cannot alter published documents", async () => {
+    const reservation=await reserve(a.id,"a","immutable.pdf","application/pdf",pdf.length);
+    assert.equal(reservation.status,201); const {upload:grant}=await reservation.json();
+    const stageUrl=new URL(grant.url);
+    const finalPath=stageUrl.pathname.replace("/object/upload/sign/","/object/").replace("/staging/","/");
+    const finalUploadUrl=`${stageUrl.origin}${finalPath}`;
+    assert.equal((await fetch(finalUploadUrl,{method:"POST",headers:{Authorization:`Bearer ${tokens.a}`,"Content-Type":"application/pdf"},body:pdf})).status,403);
+    const foreignGrantUrl=grant.url.replace(a.id,b.id);
+    assert.equal((await fetch(foreignGrantUrl,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:pdf})).status,403);
+    assert.equal((await api("POST",`/api/pets/${a.id}/documents/${grant.documentId}/complete`,"b",{})).status,404);
+    assert.equal((await api("POST",`/api/pets/${a.id}/documents/${grant.documentId}/complete`,undefined,{})).status,401);
+    assert.equal((await api("POST",`/api/pets/${a.id}/documents/${grant.documentId}/complete`,"a",{path:"forged"})).status,422);
+    assert.equal((await fetch(grant.url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:pdf})).status,200);
+    const stageRead=`${stageUrl.origin}${stageUrl.pathname.replace("/object/upload/sign/","/object/authenticated/")}`;
+    assert.equal((await fetch(stageRead,{headers:{Authorization:`Bearer ${tokens.a}`}})).status,403);
+    const item=`/api/pets/${a.id}/documents/${grant.documentId}`;
+    assert.equal((await api("GET",item,"a")).status,404);
+    const completions=await Promise.all([api("POST",`${item}/complete`,"a",{}),api("POST",`${item}/complete`,"a",{})]);
+    assert.ok(completions.some(response=>response.status===201));
+    assert.ok(completions.every(response=>[201,409].includes(response.status)));
+    // A still-valid staging grant can be replayed after its old object was removed.
+    // It must remain unable to affect the independently validated final byte snapshot.
+    assert.equal((await fetch(grant.url,{method:"PUT",headers:{"Content-Type":"text/html","x-upsert":"true"},body:"<script>untrusted</script>"})).status,200);
+    const signed=await (await api("GET",item,"a")).json();
+    assert.deepEqual(new Uint8Array(await (await fetch(signed.url)).arrayBuffer()),pdf);
+    assert.equal((await api("POST",`${item}/complete`,"a",{})).status,201);
+    const finalGrant=`${stageUrl.origin}${stageUrl.pathname.replace("/staging/","/")}`;
+    assert.equal((await fetch(finalGrant,{method:"POST",headers:{Authorization:`Bearer ${tokens.a}`,"Content-Type":"application/json"},body:"{}"})).status,403);
+    await api("DELETE",item,"a"); await expireUploads(); await cron();
+  });
+  await t.test("abandoned reservations and size-mismatched direct uploads never become READY", async () => {
+    const abandoned=await reserve(a.id,"a","abandoned.pdf","application/pdf",pdf.length);
+    assert.equal(abandoned.status,201); const {upload:grant}=await abandoned.json();
+    const item=`/api/pets/${a.id}/documents/${grant.documentId}`;
+    assert.equal((await api("GET",item,"a")).status,404);
+    await expireUploads();
+    assert.equal((await api("POST",`${item}/complete`,"a",{})).status,409);
+    await cron();
+    assert.equal((await api("POST",`${item}/complete`,"a",{})).status,404);
+    assert.equal((await fetch(grant.url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:pdf})).status,403);
+    const mismatch=await reserve(a.id,"a","mismatch.pdf","application/pdf",pdf.length+1);
+    const {upload:other}=await mismatch.json();
+    assert.equal((await fetch(other.url,{method:"PUT",headers:{"Content-Type":"application/pdf"},body:pdf})).status,200);
+    assert.equal((await api("POST",`/api/pets/${a.id}/documents/${other.documentId}/complete`,"a",{})).status,422);
+    assert.equal((await api("GET",`/api/pets/${a.id}/documents/${other.documentId}`,"a")).status,404);
+    await expireUploads(); await cron();
   });
   await t.test("document inventory survives pet deletion and the worker removes orphaned objects", async () => {
     assert.equal((await api("GET","/documents","a")).status,200);
     assert.equal((await api("DELETE",`/api/pets/${a.id}`,"a")).status,204);
     assert.equal((await api("GET",`/api/pets/${a.id}/documents/${document.id}`,"a")).status,404);
+    await expireUploads();
     const job=await cron(); assert.equal(job.status,200);
     assert.equal((await storageStats()).count,0);
     const repeat=await cron(); assert.equal(repeat.status,200);

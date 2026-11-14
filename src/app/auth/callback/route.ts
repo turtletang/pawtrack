@@ -1,3 +1,4 @@
+import { callbackOrigin } from "@/lib/app-url";
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { authConfigured } from "@/lib/supabase/config";
@@ -15,7 +16,7 @@ export async function GET(request: Request) {
       }
     } catch { /* Invalid/expired codes or upstream failures fail closed. */ }
   }
-  const response = NextResponse.redirect(new URL(path, url.origin));
+  const response = NextResponse.redirect(new URL(path, callbackOrigin(request.url)));
   response.headers.set("Cache-Control", "private, no-store");
   response.headers.set("Referrer-Policy", "no-referrer");
   return response;

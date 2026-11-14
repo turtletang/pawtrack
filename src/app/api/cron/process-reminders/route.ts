@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { validCronAuthorization } from "@/lib/server/cron-auth";
 import { processReminders } from "@/lib/server/reminders";
 import { cleanupStorage } from "@/lib/server/documents";
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 export async function GET(request: Request) {

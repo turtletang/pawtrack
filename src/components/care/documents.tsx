@@ -37,9 +37,26 @@ function UploadForm({ pets, petId, onClose, onSaved }: { pets: { id: string; nam
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); const file = form.get("file");
     if (!(file instanceof File) || !file.size || file.size > MAX_DOCUMENT_BYTES) { setError("Choose a nonempty file up to 10 MB."); return; }
-    const body = new FormData(); body.set("file", file); setBusy(true); setError("");
-    try { const response = await fetch(`/api/pets/${form.get("petId")}/documents`, { method: "POST", body }); const data = await response.json(); if (!response.ok) throw new Error(data.error); onSaved(); }
-    catch (error) { setError(error instanceof Error ? error.message : "Upload failed. Please try again."); } finally { setBusy(false); }
+    setBusy(true); setError("");
+    let reservedId: string | undefined; let finalizing = false;
+    const id = String(form.get("petId"));
+    try {
+      const reservation = await fetch(`/api/pets/${id}/documents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: file.name, mimeType: file.type, sizeBytes: file.size }) });
+      const data = await reservation.json(); if (!reservation.ok) throw new Error(data.error);
+      reservedId = data.upload.documentId;
+      // File bytes go directly to private Supabase Storage, never through the Next function.
+      const sent = await fetch(data.upload.url, { method: "PUT", headers: { "Content-Type": file.type, "apikey": process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || "", "x-upsert": "false", "cache-control": "max-age=0" }, body: file, signal: AbortSignal.timeout(120000), referrerPolicy: "no-referrer" });
+      if (!sent.ok) throw new Error("The file transfer failed. Please try again.");
+      finalizing = true;
+      const completed = await fetch(`/api/pets/${id}/documents/${reservedId}/complete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const result = await completed.json(); if (!completed.ok) throw new Error(result.error);
+      onSaved();
+    } catch (error) {
+      if (reservedId && !finalizing) {
+        try { await fetch(`/api/pets/${id}/documents/${reservedId}`, { method: "DELETE" }); } catch { /* Expired reservations are cleaned by cron. */ }
+      }
+      setError(error instanceof Error ? error.message : "Upload failed. Refresh to check whether it completed before retrying.");
+    } finally { setBusy(false); }
   }
   return <dialog ref={dialog} aria-labelledby="upload-title" className="modal m-auto border-0 backdrop:bg-[#1b2d2666]" onCancel={e => { e.preventDefault(); if (!busy) onClose(); }}><div className="flex items-center justify-between mb-5"><h2 id="upload-title" className="text-xl font-semibold">Keep a care document</h2><Button variant="ghost" size="icon" disabled={busy} aria-label="Close upload form" onClick={onClose}><X size={18} /></Button></div><form onSubmit={save}><fieldset disabled={busy} className="space-y-5"><label className="block"><span className="field-label">Companion *</span><select name="petId" defaultValue={petId || pets[0]?.id} className="h-11 w-full rounded-lg border border-border bg-white px-3">{pets.map(pet => <option key={pet.id} value={pet.id}>{pet.name}</option>)}</select></label><label className="block rounded-xl border border-dashed border-[#b7c7ab] bg-muted p-6"><span className="field-label flex items-center gap-2"><Upload size={17} />Choose a medical document *</span><input className="mt-3 text-xs w-full" type="file" name="file" required accept="application/pdf,image/jpeg,image/png,image/webp" /><span className="block text-xs text-muted-foreground mt-4">PDF, JPG, PNG, or WebP · Maximum 10 MB. File size and content are checked on the server.</span></label></fieldset>{error && <p role="alert" className="alert mt-4">{error}</p>}<div className="flex justify-end gap-3 mt-6"><Button type="button" variant="outline" disabled={busy} onClick={onClose}>Cancel</Button><Button disabled={busy}>{busy && <LoaderCircle className="animate-spin" size={15} />}{busy ? "Uploading…" : "Upload privately"}</Button></div></form></dialog>;
 }

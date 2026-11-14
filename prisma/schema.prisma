@@ -153,4 +153,5 @@ enum DocumentStatus {
   UPLOADING
   READY
   DELETING
+  VERIFYING
 }

@@ -1,3 +1,4 @@
+import { appOrigin } from "./app-url";
 import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
@@ -13,12 +14,8 @@ export type RecoveryState = { error?: string; message?: string; updated?: boolea
 type RecoveryAuth = Pick<SupabaseClient["auth"], "resetPasswordForEmail" | "getUser" | "updateUser" | "signOut" | "exchangeCodeForSession">;
 
 // Never derive email destinations from an untrusted form, Host, or Origin header.
-export function authRedirectUrl(path: "/auth/callback" | "/auth/recovery", siteUrl = "http://localhost:3000") {
-  const url = new URL(siteUrl);
-  if ((url.protocol !== "https:" && !(url.protocol === "http:" && url.hostname === "localhost")) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
-    throw new Error("APP_URL must be an HTTPS origin (or http://localhost:3000 locally).");
-  }
-  return new URL(path, url).toString();
+export function authRedirectUrl(path: "/auth/callback" | "/auth/recovery", siteUrl?: string) {
+  return new URL(path, appOrigin(siteUrl)).toString();
 }
 
 export function recoveryRedirectUrl(siteUrl?: string) {

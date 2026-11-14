@@ -34,3 +34,11 @@ test("only PDF, JPEG, PNG and WebP signatures are accepted", () => {
   assert.equal(sniffDocument(new TextEncoder().encode("<svg></svg>")), null);
   assert.equal(sniffDocument(new Uint8Array([0xff,0xd8])), null);
 });
+
+test("upload reservations accept only bounded metadata, never caller-specified keys or owners", async () => {
+  const { documentUploadSchema, stagingPath } = await import("../src/lib/documents");
+  const metadata = { name: "report.pdf", mimeType: "application/pdf", sizeBytes: 10 };
+  assert.equal(documentUploadSchema.safeParse(metadata).success,true);
+  for (const extra of [{path:"victim/file"},{ownerId:"other"},{petId:"other"},{sizeBytes:0},{sizeBytes:MAX_DOCUMENT_BYTES+1},{mimeType:"text/html"}]) assert.equal(documentUploadSchema.safeParse({...metadata,...extra}).success,false);
+  assert.equal(stagingPath("owner","pet","id","application/pdf"),"owner/pet/staging/id.pdf");
+});

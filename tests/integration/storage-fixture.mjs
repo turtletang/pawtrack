@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 // Simulated upstream Storage HTTP service. The actual app, SDK and PostgreSQL remain real.
 export function storageFixture({ identities, serviceKey, database }) {
-  const objects = new Map(); const signed = new Map(); const failedDelete = new Set();
+  const objects = new Map(); const signed = new Map(); const uploadGrants = new Map(); const failedDelete = new Set();
   return async function handle(request, response) {
     const url = new URL(request.url, "http://fixture");
     const credential = request.headers.authorization?.replace(/^Bearer /, "");
@@ -15,6 +15,7 @@ export function storageFixture({ identities, serviceKey, database }) {
         await client.query("BEGIN");
         await client.query("SELECT set_config('request.jwt.claim.sub', $1, true)", [owner]);
         await client.query("SET LOCAL ROLE authenticated");
+        await client.query("SET LOCAL TIME ZONE 'Asia/Shanghai'");
         const operation = action === "upload" ? "insert" : action === "delete" ? "delete" : "read";
         const result = await client.query("SELECT public.pawtrack_document_access($1, $2) AS allowed", [path, operation]);
         if (!result.rows[0].allowed) return false;
@@ -26,6 +27,31 @@ export function storageFixture({ identities, serviceKey, database }) {
         }
         return true;
       } finally { await client.query("ROLLBACK"); client.release(); }
+    }
+    if (url.pathname === "/test-storage-expire") {
+      if (!admin) return fail(401, "Denied");
+      uploadGrants.clear();
+      await database().query(`UPDATE "StorageObject" SET "leaseUntil"=(CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - interval '1 minute' WHERE path LIKE '%/staging/%' OR status IN ('UPLOADING','VERIFYING')`);
+      response.end(JSON.stringify({ expired: true })); return;
+    }
+    if (url.pathname.startsWith("/storage/v1/object/upload/sign/pet-documents/")) {
+      const path=decodeURIComponent(url.pathname.split("/storage/v1/object/upload/sign/pet-documents/")[1]);
+      if (request.method === "POST") {
+        if (!await allowed(path,"upload")) return fail(403,"Denied upload grant");
+        const token=randomUUID(); uploadGrants.set(token,{path, expires:Date.now()+7200000});
+        response.end(JSON.stringify({url:`/object/upload/sign/pet-documents/${path}?token=${token}`})); return;
+      }
+      if (request.method === "PUT") {
+        const grant=uploadGrants.get(url.searchParams.get("token"));
+        if (!grant || grant.path!==path || grant.expires<Date.now()) return fail(403,"Invalid upload grant");
+        if (objects.has(path)) return fail(409,"Already exists; grant is not upsertable");
+        const chunks=[]; for await(const chunk of request) chunks.push(chunk); const bytes=Buffer.concat(chunks);
+        if (bytes.length>10485760) return fail(413,"Bucket file limit exceeded");
+        objects.set(path,{bytes,mime:request.headers["content-type"]});
+        await database().query("INSERT INTO storage.objects(name,bucket_id) VALUES ($1,'pet-documents')",[path]);
+        if (bytes.includes(Buffer.from("FAIL_UPLOAD"))) return fail(500,"Uncertain direct upload failure");
+        response.end(JSON.stringify({Key:`pet-documents/${path}`})); return;
+      }
     }
     if (url.pathname === "/test-storage-stats") {
       if (!admin) return fail(401, "Denied");

@@ -1,3 +1,4 @@
+import { callbackOrigin } from "@/lib/app-url";
 import { NextResponse } from "next/server";
 import { authConfigured } from "@/lib/supabase/config";
 import { createClient } from "@/lib/supabase/server";
@@ -9,7 +10,7 @@ export async function GET(request: Request) {
     ? await completeRecovery((await createClient()).auth, url.searchParams)
     : "/setup";
   // Fixed destinations only: never redirect to a client-supplied next URL.
-  const response = NextResponse.redirect(new URL(path, url.origin));
+  const response = NextResponse.redirect(new URL(path, callbackOrigin(request.url)));
   response.headers.set("Cache-Control", "private, no-store");
   response.headers.set("Referrer-Policy", "no-referrer");
   return response;

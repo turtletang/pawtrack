@@ -23,7 +23,7 @@ export async function processReminders() {
     const vaccinations = await tx.$queryRaw<Vaccination[]>`SELECT * FROM "Vaccination" ORDER BY id FOR UPDATE`;
     let generated = 0;
     for (const vaccination of vaccinations) generated += await syncVaccination(tx, vaccination);
-    await tx.$executeRaw`UPDATE "Reminder" r SET status = 'DISMISSED', "dismissedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+    await tx.$executeRaw`UPDATE "Reminder" r SET status = 'DISMISSED', "dismissedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE r.source = 'VACCINATION' AND r.status = 'PENDING' AND NOT EXISTS
       (SELECT 1 FROM "Vaccination" v WHERE v.id = r."vaccinationId" AND v."petId" = r."petId" AND v."nextDueAt" = r."dueAt")`;
     const result = await tx.reminder.updateMany({ where: { status: "PENDING", dueAt: { lte: new Date() }, processedAt: null }, data: { processedAt: new Date() } });

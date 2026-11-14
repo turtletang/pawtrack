@@ -14,10 +14,11 @@
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "test:integration": "node scripts/test-integration.mjs",
-    "cron:local": "node scripts/cron-local.mjs"
+    "cron:local": "node scripts/cron-local.mjs",
+    "check:secrets": "node scripts/check-secrets.mjs"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": "24.x"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.1",
@@ -25,6 +26,7 @@
     "@radix-ui/react-slot": "^1.5.0",
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.119.0",
+    "@vercel/functions": "^3.11.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "dotenv": "^18.0.10",

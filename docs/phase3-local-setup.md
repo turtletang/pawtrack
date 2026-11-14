@@ -1,5 +1,7 @@
 # Phase 3 — local setup and verification
 
+**Historical Phase 3 guide:** Phase 4 replaces multipart uploads with direct staging and server verification. Follow [the current deployment/setup guide](vercel-deployment.md) for the latest protocol and Storage helper.
+
 Phase 3 adds persistent in-app reminders and private medical documents. No email/SMS sender, production deployment, hosted migration, bucket creation, or hosted policy change has been performed by this implementation.
 
 ## 1. Review and apply the app migration manually
